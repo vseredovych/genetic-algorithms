@@ -1,6 +1,8 @@
-import numpy as np
 from typing import Callable
+from ipywidgets import IntProgress
 
+import numpy as np
+import copy
 
 class MultiDimGA:
     def __init__(self):
@@ -13,9 +15,13 @@ class MultiDimGA:
         self.max_no_conv_iter = None
         self.tournament_n = None
         self.mutation_p = None
-        self.crossbreeding_p = None
-        self.max = None
-
+        self.crossover_p = None
+        self.min_lifetime = None
+        self.max_lifetime = None
+        self.reproduction_p = None
+        self.max_problem = None
+        self.verbose = None
+        
         self.m = 0
         self.bit_array_sizes = []
         self.history = []
@@ -27,10 +33,14 @@ class MultiDimGA:
               n: int = 100,
               tournament_n: int = 3,
               mutation_p: float = 0.1,
-              crossbreeding_p: float = 0.9,
+              crossover_p: float = 0.9,
               max_iter: int = 100,
               max_no_conv_iter: int = 20,
-              max: bool = False) -> float:
+              min_lifetime: int = 10,
+              max_lifetime: int = 10,
+              reproduction_p: float = 0.5,
+              max_problem: bool = False,
+              verbose: bool = False) -> float:
 
         self.h = h
         self.n = n
@@ -39,35 +49,50 @@ class MultiDimGA:
         self.intervals = intervals
         self.tournament_n = tournament_n
         self.mutation_p = mutation_p
-        self.crossbreeding_p = crossbreeding_p
+        self.crossover_p = crossover_p
         self.max_iter = max_iter
         self.max_no_conv_iter = max_no_conv_iter
-        self.max = max
-
+        self.max_problem= max_problem
+        self.verbose = verbose
+        self.progress_bar = IntProgress(max=max_iter)
+        
+        self.min_lifetime = min_lifetime
+        self.max_lifetime = max_lifetime
+        self.eta = 1/2 * (self.max_lifetime - self.min_lifetime)
+        self.reproduction_p = reproduction_p
+        
+        
         self.bit_array_sizes = self._calc_bit_array_size()
         self.m = np.sum(self.bit_array_sizes)
 
-        first_generation = np.random.choice(2, size=[self.n, self.m])
-
-        args, args_eval = self._genetic_algorithm(first_generation)
-
+        args, solution = self._genetic_algorithm()
         return args, f(*args)
 
-    def _genetic_algorithm(self, generation: np.ndarray) -> tuple:
+    def _genetic_algorithm(self) -> tuple:
         self.history = []
-        solution = np.inf
+        best_score = np.inf
+        best_args = None
         no_conv_iter = 0
-
+        
+        display(self.progress_bar)
+        
+        population = self._initialize_population()
         for i in range(self.max_iter):
-            generation = self._next_generation(generation)
+            population = self._next_population(population)
 
-            args = self._arg_eval_generation(generation)
-            args_eval = self._eval_generation(generation)
+            if population.shape[0] == 0:
+                break
 
-            self.history.append(args_eval)
+            args, score = self._eval_population(population)            
 
-            if args_eval < solution:
-                solution = args_eval
+            self.history.append(score)
+
+            if (i+1) % 1 == 0:
+                self.progress_bar.value = i + 1
+            
+            if score < best_score:
+                best_score = score
+                best_args = args
                 no_conv_iter = 0
             else:
                 no_conv_iter += 1
@@ -75,39 +100,78 @@ class MultiDimGA:
             if no_conv_iter > self.max_no_conv_iter:
                 break
 
-        return args, args_eval
+        self.progress_bar.value = self.max_iter
+        return best_args, best_score
+    
+    def _initialize_population(self):
+        population_values = np.random.choice(2, size=[self.n, self.m])
+        population = np.array([{'age': 0, 'value': ind} for ind in population_values])
+        return population
 
-    def _next_generation(self, generation: np.ndarray) -> np.ndarray:
-        next_generation = []
+    def _next_population(self, population: np.ndarray) -> np.ndarray:
+        population_lifetime = self._calc_lifetime(population)
+        survived = []
 
-        while len(next_generation) < self.n:
-            x1 = self._tournament(generation)
-            x2 = self._tournament(generation)
+        for ind in population:
+            ind['age'] = ind['age'] + 1
 
-            if np.random.rand() > self.mutation_p:
-                x1, x2 = self._mutation(x1), self._mutation(x2)
+        for ind, lifetime in zip(population, population_lifetime):
+            if ind['age'] < lifetime:
+                survived.append(ind)
+                
+        died = len(population) - len(survived)
 
-            if np.random.rand() > self.crossbreeding_p:
-                x1, x2 = self._crossbreeding(x1, x2)
+        offspring = self._spawn_offspring(np.array(survived))
+        new_population = np.concatenate([survived + offspring])
+        
+        if self.verbose:
+            print(f"Total: {len(new_population)}; Born: {len(offspring)}; Died: {died}")
+        
+        return new_population
 
-            next_generation.extend([x1, x2])
+    def _spawn_offspring(self, population):
+        offspring = []
+        
+        for _ in range(int(population.shape[0]/2)):
+            if np.random.rand() < self.reproduction_p:
+                x1 = self._tournament(population)
+                x2 = self._tournament(population)
 
-        return np.array(next_generation).reshape(self.n, self.m)
+                if np.random.rand() < self.mutation_p:
+                    x1, x2 = self._mutation(x1), self._mutation(x2)
 
-    def _eval(self, individual: np.ndarray) -> float:
-        arguments = self._arg_eval_multi_dim(individual)
-        y = self.f(*arguments)
-        return -y if self.max else y
+                if np.random.rand() < self.crossover_p:
+                    x1, x2 = self._crossover(x1, x2)
+                
+                x1['age'], x2['age'] = 0, 0
+                offspring.extend([x1, x2])
 
-    def _arg_eval_single_dim(self, individual: np.ndarray, a: int, b: int, m: int) -> float:
+        return offspring
+
+    def _calc_lifetime(self, population):
+        scores = - np.array([self._eval(ind) for ind in population])
+        scores_ = scores - np.min(scores) + 1
+        
+        scores_min_abs = np.min(np.abs(scores))
+        scores_max_abs = np.max(np.abs(scores_))
+
+        lifetime = self.min_lifetime + 2*self.eta*(scores_ - scores_max_abs)/(scores_max_abs - scores_min_abs)
+        return lifetime
+    
+    def _binary_to_decimal(self, bits: np.ndarray, a: int, b: int, m: int) -> float:
         decimal = 0
-        for idx, val in enumerate(individual):
-            decimal += 2 ** idx * val
+        for idx, bit in enumerate(bits):
+            decimal += 2 ** idx * bit
 
         return (b - a) / (2 ** m - 1) * decimal + a
+    
+    def _eval(self, individual: dict) -> float:
+        args = self._arg_eval(individual)
+        y = self.f(*args)
+        return -y if self.max_problem else y
 
-    def _arg_eval_multi_dim(self, individual: np.ndarray) -> list:
-        arguments = np.zeros(self.dim)
+    def _arg_eval(self, individual: dict) -> list:
+        args = np.zeros(self.dim)
 
         for i in range(self.dim):
             a = self.intervals[i][0]
@@ -116,36 +180,36 @@ class MultiDimGA:
             clip_from = sum(self.bit_array_sizes[:i])
             clip_to = sum(self.bit_array_sizes[:i+1])
 
-            arguments[i] = self._arg_eval_single_dim(
-                individual[clip_from:clip_to], a, b, m
+            args[i] = self._binary_to_decimal(
+                individual['value'][clip_from:clip_to], a, b, m
             )
 
-        return arguments
+        return args
 
-    def _eval_generation(self, generation: np.ndarray) -> float:
-        return np.min([self._eval(ind) for ind in generation])
+    def _eval_population(self, population: np.ndarray) -> tuple:
+        index = np.argmin([self._eval(ind) for ind in population])
 
-    def _arg_eval_generation(self, generation: np.ndarray) -> tuple:
-        index = np.argmin([self._eval(ind) for ind in generation])
-        return self._arg_eval_multi_dim(generation[index])
+        ind_args = self._arg_eval(population[index])
+        ind_score = self._eval(population[index])
 
-    def _tournament(self, generation: np.ndarray) -> np.ndarray:
-        contestants_indices = np.random.randint(self.n, size=self.tournament_n)
-        contestants = generation[contestants_indices]
+        return ind_args, ind_score
+
+    def _tournament(self, population: np.ndarray) -> np.ndarray:
+        contestants_indices = np.random.randint(population.shape[0], size=self.tournament_n)
+        contestants = population[contestants_indices]
         contestants_eval = [self._eval(contestant) for contestant in contestants]
         champion_index = np.argmin(contestants_eval)
-        return contestants[champion_index]
+        return copy.deepcopy(contestants[champion_index])
 
-    def _mutation(self, x: np.ndarray) -> np.ndarray:
+    def _mutation(self, x: dict) -> np.ndarray:
         index = np.random.randint(self.m)
-        x[index] = bool(x[index]) ^ 1
+        x['value'][index] = bool(x['value'][index]) ^ True
         return x
 
-    def _crossbreeding(self, x1: np.ndarray, x2: np.ndarray) -> tuple:
-        index = np.random.randint(self.m)
-        buff = x1
-        x1[index:] = x2[index:]
-        x2[index:] = buff[index:]
+    def _crossover(self, x1: dict, x2: dict) -> tuple:
+        points = np.random.randint(self.m, size=(2))
+        x1['value'][min(points):max(points)], x2['value'][min(points):max(points)] = \
+        x2['value'][min(points):max(points)], x1['value'][min(points):max(points)]
         return x1, x2
 
     def _calc_bit_array_single(self, interval: np.ndarray) -> int:
@@ -163,20 +227,4 @@ class MultiDimGA:
             array_sizes.append(self._calc_bit_array_single(interval))
 
         return array_sizes
-
-
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    #f = lambda x, y: x * y
-    f = lambda x, y: np.sin(10*x) + x * np.cos(2*np.pi*y)
-    # f(x1,x2) = sin(10x1) +x1cos(2πx2), x1∈[−2,2],x2∈[0,1].
-
-    single_dim_ga = MultiDimGA()
-    res = single_dim_ga.solve(f)
-
-    print(res)
-
-    plt.plot(single_dim_ga.history)
-    plt.show()
-
 
